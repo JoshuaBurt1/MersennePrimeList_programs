@@ -1,6 +1,6 @@
 # MP List Programs 
 
-This repository contains optimized scripts designed for maximum computational throughput. Depending on your hardware constraints, you can choose between our industry-leading CPU or GPU implementations.
+Depending on your hardware constraints, you can choose between CPU or GPU implementations.
 
 ## ⚡ Quick Reference
 
