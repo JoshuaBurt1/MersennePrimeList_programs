@@ -11,4 +11,4 @@ Depending on your hardware constraints, you can choose between CPU or GPU implem
 | Performance Tier | Script | Target Hardware |
 | :--- | :--- | :--- |
 | **🏆 Fastest CPU** | `mp_cpu.py` | Multi-core Processors |
-| **🔥 Fastest GPU** | `mp_gpu_linux.py` | NVIDIA CUDA-enabled GPUs |
+| **🔥 Fastest GPU** | `mp_gpu_linux.cu` | NVIDIA CUDA-enabled GPUs |
