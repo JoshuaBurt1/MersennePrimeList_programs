@@ -6,6 +6,7 @@
 #include <cuda_runtime.h>
 #include <gmp.h>
 #include <omp.h>
+#include <set>
 
 // Flattened CYCLE_DATA (4 * 4 * 16 = 256 elements)
 __constant__ unsigned long long d_CYCLE_DATA[256] = {
@@ -20,49 +21,61 @@ __global__ void mega_sieve(const unsigned long long* candidates,
                            const unsigned int* d_idxs, 
                            bool* is_eliminated, 
                            int num_p, int factor_limit) {
-    int tid_p = blockIdx.x * blockDim.x + threadIdx.x;
     int tid_f = blockIdx.y * blockDim.y + threadIdx.y;
+    int tid_p = blockIdx.x * blockDim.x + threadIdx.x;
+    if (tid_p >= num_p) return;
 
-    if (tid_p < num_p && tid_f < factor_limit) {
-        if (is_eliminated[tid_p]) return;
-        unsigned long long p = candidates[tid_p];
-        unsigned int base_idx = (o_idxs[tid_p] * 64) + (d_idxs[tid_p] * 16);
+    unsigned long long p = candidates[tid_p];
+    unsigned int base_idx = (o_idxs[tid_p] * 64) + (d_idxs[tid_p] * 16);
 
-        for (int j = 0; j < 16; j++) {
-            unsigned long long f = (p * (unsigned long long)tid_f * 120) + (p * d_CYCLE_DATA[base_idx + j]) + 1;
-            unsigned long long res = 1, base = 2, exp = p;
-            
-            while (exp > 0) {
-                if (exp & 1) res = (unsigned long long)((unsigned __int128)res * base % f);
-                base = (unsigned long long)((unsigned __int128)base * base % f);
-                exp >>= 1;
-            }
-            if (res == 1) { is_eliminated[tid_p] = true; break; }
+    for (int j = 0; j < 16; j++) {
+        unsigned long long f = (p * (unsigned long long)tid_f * 120) + (p * d_CYCLE_DATA[base_idx + j]) + 1;
+        unsigned long long res = 1, base = 2, exp = p;
+        
+        while (exp > 0) {
+            if (exp & 1) res = (unsigned long long)((unsigned __int128)res * base % f);
+            base = (unsigned long long)((unsigned __int128)base * base % f);
+            exp >>= 1;
         }
+        if (res == 1) { is_eliminated[tid_p] = true; break; }
+    }
+}
+
+// Optimized modular reduction for Mersenne numbers: 2^p - 1
+void mersenne_mod_inplace(mpz_t s, unsigned long p, mpz_t mask, mpz_t temp) {
+    mpz_tdiv_q_2exp(temp, s, p);
+    mpz_and(s, s, mask);
+    mpz_add(s, s, temp);
+    
+    if (mpz_cmp(s, mask) >= 0) {
+        mpz_sub(s, s, mask);
     }
 }
 
 bool lucas_lehmer(unsigned long p) {
-    if (p == 2) return true;
-    mpz_t s, base, mask, temp;
-    mpz_inits(s, base, mask, temp, NULL);
-    mpz_set_ui(s, 4);
-    mpz_set_ui(base, 1);
-    mpz_mul_2exp(base, base, p); 
-    mpz_sub_ui(mask, base, 1);
+    mpz_t s, mask, temp;
+    mpz_inits(s, mask, temp, NULL);
 
-    for (unsigned long i = 0; i < p - 2; i++) {
+    mpz_set_ui(mask, 1);
+    mpz_mul_2exp(mask, mask, p);
+    mpz_sub_ui(mask, mask, 1);
+    mpz_set_ui(s, 4);
+
+    // Iteration: s = (s^2 - 2) mod (2^p - 1)
+    unsigned long iterations = p - 2;
+    for (unsigned long i = 0; i < iterations; i++) {
         mpz_mul(s, s, s);
         mpz_sub_ui(s, s, 2);
-        while (mpz_cmp(s, base) >= 0) {
-            mpz_tdiv_q_2exp(temp, s, p);
-            mpz_and(s, s, mask);
-            mpz_add(s, s, temp);
-        }
+        
+        // Fast Mersenne reduction
+        mersenne_mod_inplace(s, p, mask, temp);
     }
-    bool result = (mpz_cmp_ui(s, 0) == 0 || mpz_cmp(s, mask) == 0);
-    mpz_clears(s, base, mask, temp, NULL);
-    return result;
+
+    // If s == 0 (mod M_p), then M_p is prime
+    bool is_prime = (mpz_cmp_ui(s, 0) == 0);
+
+    mpz_clears(s, mask, temp, NULL);
+    return is_prime;
 }
 
 int main() {
@@ -74,17 +87,17 @@ int main() {
     for (int start : origins) {
         for (int i = 0; i < ARRAY_SIZE; i++) {
             unsigned long long p = start + 12 * i;
-            if (p > 3) {
-                mpz_t g_p; mpz_init_set_ui(g_p, p);
-                if (mpz_probab_prime_p(g_p, 25)) h_candidates.push_back(p);
-                mpz_clear(g_p);
-            }
+            mpz_t g_p; mpz_init_set_ui(g_p, p);
+            if (mpz_probab_prime_p(g_p, 25)) h_candidates.push_back(p);
+            mpz_clear(g_p);
         }
     }
     std::sort(h_candidates.begin(), h_candidates.end());
     int num_p = h_candidates.size();
+    
     std::cout << "Total Candidates: " << num_p << std::endl;
 
+    // Mapping for GPU indexing
     std::vector<unsigned int> h_o_idxs(num_p), h_d_idxs(num_p);
     for (int i = 0; i < num_p; i++) {
         h_o_idxs[i] = (h_candidates[i] - 5) % 12 == 0 ? 0 : (h_candidates[i] - 7) % 12 == 0 ? 1 : (h_candidates[i] - 11) % 12 == 0 ? 2 : 3;
@@ -92,6 +105,7 @@ int main() {
         h_d_idxs[i] = (last_digit == 1) ? 0 : (last_digit == 3) ? 1 : (last_digit == 7) ? 2 : 3;
     }
 
+    // CUDA Memory allocation and transfer
     unsigned long long *d_cand; unsigned int *d_o, *d_d; bool *d_elim;
     cudaMalloc(&d_cand, num_p * sizeof(unsigned long long));
     cudaMalloc(&d_o, num_p * sizeof(unsigned int));
@@ -106,7 +120,6 @@ int main() {
     dim3 threads(16, 16);
     dim3 blocks((num_p + 15) / 16, (FACTOR_UP_TO + 15) / 16);
     
-    // --- TIME GPU ---
     auto start_gpu = std::chrono::high_resolution_clock::now();
     mega_sieve<<<blocks, threads>>>(d_cand, d_o, d_d, d_elim, num_p, FACTOR_UP_TO);
     cudaDeviceSynchronize();
@@ -115,8 +128,10 @@ int main() {
     std::vector<char> h_elim(num_p);
     cudaMemcpy(h_elim.data(), d_elim, num_p * sizeof(bool), cudaMemcpyDeviceToHost);
 
-    // --- TIME CPU ---
+    // Track found primes
+    std::vector<unsigned long long> found_primes;
     int survivors = 0;
+    
     auto start_cpu = std::chrono::high_resolution_clock::now();
     #pragma omp parallel for reduction(+:survivors) schedule(dynamic)
     for (int i = 0; i < num_p; i++) {
@@ -124,21 +139,44 @@ int main() {
             survivors++;
             if (lucas_lehmer(h_candidates[i])) {
                 #pragma omp critical
-                std::cout << "PRIME (p-value): " << h_candidates[i] << std::endl;
+                {
+                    found_primes.push_back(h_candidates[i]);
+                    std::cout << "PRIME (p-value): " << h_candidates[i] << std::endl;
+                }
             }
         }
     }
     auto end_cpu = std::chrono::high_resolution_clock::now();
 
-    std::chrono::duration<double> gpu_dur = end_gpu - start_gpu;
-    std::chrono::duration<double> cpu_dur = end_cpu - start_cpu;
+    // PRINT NOT FACTORED IMMEDIATELY AFTER CANDIDATES
+    std::cout << "Not factored:      " << survivors << std::endl;
+
+    // --- FINAL LIST LOGIC ---
+    std::vector<unsigned long long> small_mersenne = {2, 3, 5, 7, 13, 17, 19, 31, 61};
+    std::set<unsigned long long> final_set(found_primes.begin(), found_primes.end());
+    for (auto p : small_mersenne) {
+        final_set.insert(p);
+    }
 
     std::cout << "\n--- Statistics ---" << std::endl;
-    std::cout << "GPU Sieve Time: " << gpu_dur.count() << "s" << std::endl;
-    std::cout << "CPU LL Time:    " << cpu_dur.count() << "s" << std::endl;
-    std::cout << "Survivors:      " << survivors << std::endl;
+    std::cout << "GPU Sieve Time: " << (std::chrono::duration<double>(end_gpu - start_gpu)).count() << "s" << std::endl;
+    std::cout << "CPU LL Time:    " << (std::chrono::duration<double>(end_cpu - start_cpu)).count() << "s" << std::endl;
 
-    cudaFree(d_cand); cudaFree(d_o); cudaFree(d_d); cudaFree(d_elim);
+    std::cout << "\nFinal p-values found (including small values divided over during trial division):" << std::endl;
+    bool first = true;
+    for (unsigned long long p : final_set) {
+        if (!first) std::cout << ", ";
+        std::cout << p;
+        first = false;
+    }
+    
+    // Display the count of the final set
+    std::cout << "\n\nup to M " << final_set.size() << std::endl;
+
+    cudaFree(d_cand); 
+    cudaFree(d_o); 
+    cudaFree(d_d); 
+    cudaFree(d_elim);
+    
     return 0;
 }
-
