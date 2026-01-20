@@ -4,7 +4,7 @@ The scripts run separately.
 
 They are different implementations of printing out a list of Mersenne Primes.
 
-Depending on your hardware constraints, you can choose between CPU or GPU implementations
+Depending on your hardware constraints, you can choose between CPU or GPU implementations.
 
 ## ⚡ Quick Reference
 
